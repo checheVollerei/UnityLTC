@@ -1,0 +1,180 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+//CS引入cginc文件需要完整的路径
+#include "Assets/LTC/Resources/PBR.cginc"
+
+Texture2D<float4> _ltcSpecular;
+Texture2D<float4> _ltcMagFresnel;
+
+float4x4 _ProToWorld;
+float3 _CameraPosition;
+
+Texture2D<float4> _LightTarget;
+Texture2D<float4> _LightDepth;
+
+
+
+RWTexture2D<float4> _Result;
+Texture2D<float4> _ForwardTarget;
+Texture2D<float4> _AlbedoTexture;
+Texture2D<float4> _NormalTexture;
+Texture2D<float4> _RougMateTexture;
+Texture2D<float4> _DepthTexture;
+SamplerState linear_clamp_sampler;
+SamplerState point_clamp_sampler;
+
+StructuredBuffer<float3> _VertexBuffer;
+StructuredBuffer<float2> _TexcoordBuffer;
+StructuredBuffer<int>_IndexBuffer;
+
+struct MeshData
+{
+    int StartIndex;
+    int EndIndex;
+
+    float3 MeshColor;
+
+    float SpecularIntensity;
+    int TextureStartIndex;
+};
+StructuredBuffer<MeshData> _LightObjects;
+
+
+
+float3 ACESToneMapping(float3 color, float adapted_lum)
+{
+    const float A = 2.51f;
+    const float B = 0.03f;
+    const float C = 2.43f;
+    const float D = 0.59f;
+    const float E = 0.14f;
+
+    color *= adapted_lum;
+    return (color * (A * color + B)) / (color * (C * color + D) + E);
+}
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+     //_Result[id.xy] = float4(1,0,0,0);
+    // TODO: insert actual code here!
+    uint width,height;
+    _Result.GetDimensions(width,height);
+
+    float2 uv=float2(id.x,id.y)/float2(width,height);
+    uv+=(1/float2(width,height)*0.5f);//偏移到像素中心，以获取当前像素的精确数值
+     # if UNITY_UV_STARTS_AT_TOP
+      //if (1/width < 0)
+            uv.y = 1-uv.y;
+     # endif
+
+     
+    float3 ForwardColor=_ForwardTarget.SampleLevel(linear_clamp_sampler,uv,0).rgb;
+
+    float3 AlbedoColor=_AlbedoTexture.SampleLevel(linear_clamp_sampler,uv,0).rgb;
+    //不进行Point采样会出现白边&黑边之类的
+    float depthMap=_DepthTexture.SampleLevel(point_clamp_sampler,uv,0).r;
+    #if defined (UNITY_REVERSED_Z)
+    depthMap = 1.0 - depthMap;
+    #endif
+
+
+    float3 pos=float3(uv.x*2-1,uv.y*2-1,depthMap);
+
+    float4 worldPos=mul(_ProToWorld,float4(pos.xyz,1));
+    worldPos/=worldPos.w;
+    //不进行Point采样会出现白边&黑边之类的
+    float4 NormalMap=_NormalTexture.SampleLevel(point_clamp_sampler,uv,0);
+    //不进行Point采样会出现白边&黑边之类的
+    float4 RoughMate=_RougMateTexture.SampleLevel(point_clamp_sampler,uv,0);
+    float roughness=RoughMate.z;
+    float metallic=RoughMate.w;
+    float3 N=normalize(NormalMap.xyz*2.0f-1.0f);
+    float3 V=normalize(_CameraPosition.xyz-worldPos.xyz);
+
+    //构建半球采样坐标（切线空间
+    float3x3 HS_Matrix;
+	float3 T=normalize(V-N*dot(V,N));
+	float3 BiT=normalize(cross(N,T));
+	HS_Matrix[0]=T;
+	HS_Matrix[1]=BiT;
+	HS_Matrix[2]=N;
+    //计算lut采样坐标
+    roughness*=roughness;
+    roughness=clamp( roughness,0.01f,0.99f);
+    float costheta=(acos( dot(N, V)));
+	float theta = saturate(costheta/1.57);
+	float a = saturate (roughness);
+    int LutSize;
+    _ltcSpecular.GetDimensions(LutSize,LutSize);
+    float2  coord=float2(a,theta);
+  //  coord=coord*((LutSize-1.0)/LutSize)+(0.5/LutSize);
+    coord+=((1.0f/LutSize)*0.5f);
+    //采样两个lut图
+    float4 t1=_ltcSpecular.SampleLevel(linear_clamp_sampler,coord,0);
+    float4 mf=_ltcMagFresnel.SampleLevel(linear_clamp_sampler,coord,0);
+    //根据lut图构建M矩阵
+	float3x3 M_matrix;
+	   M_matrix[0]=float3(t1.x , 0.0f   ,t1.y);
+	   M_matrix[1]=float3( 0.0f   ,1.0f , 0.0f);
+	   M_matrix[2]=float3(t1.z, 0.0f   , t1.w);
+    
+
+    float NdotV=max(0.0f,dot(N,V));
+
+
+    float3 LtcCol=0.0f;
+    uint count,stride;
+    _LightObjects.GetDimensions(count,stride);
+     for(uint i=0;i<count;i++)//循环物体数量(是submesh，也就是说一个材质球执行一次)
+     {
+        float3 ltcDif=0.0f;
+        float3 ltcSpe=0.0f;    
+        for(uint j=_LightObjects[i].StartIndex;j<_LightObjects[i].EndIndex;j+=3)
+        {
+            float2 t1=_TexcoordBuffer[_IndexBuffer[j]];
+            float2 t2=_TexcoordBuffer[_IndexBuffer[j+1]];
+            float2 t3=_TexcoordBuffer[_IndexBuffer[j+2]];
+
+            float3 v1=_VertexBuffer[_IndexBuffer[j]];
+            float3 v2=_VertexBuffer[_IndexBuffer[j+1]];
+            float3 v3=_VertexBuffer[_IndexBuffer[j+2]];
+
+            int TexOffset=_LightObjects[i].TextureStartIndex;
+
+            float3 HL1=mul(HS_Matrix,v1 - worldPos.xyz);
+            float3 HL2=mul(HS_Matrix,v2 - worldPos.xyz);
+            float3 HL3=mul(HS_Matrix,v3 - worldPos.xyz);
+            float3 ML1=mul(HL1,M_matrix);
+            float3 ML2=mul(HL2,M_matrix);
+            float3 ML3=mul(HL3,M_matrix);
+
+            ltcDif+=ClipTriangle(HL1,HL2,HL3,t1,t2,t3,TexOffset);
+            ltcSpe+=ClipTriangle(ML1,ML2,ML3,t1,t2,t3,TexOffset);
+         
+        }
+          float3 alb=AlbedoColor;
+         float3 F0=lerp(0.04f,alb,metallic);
+
+         float3 F=SchlickFrR( V,N,F0,roughness);
+
+         float3 kd= (1-F)*(1-metallic)*alb*0.3183;//(1/3.1415926);
+
+         float3 dif=kd*(ltcDif*(_LightObjects[i].MeshColor*_LightObjects[i].SpecularIntensity));
+
+         float3 Fr=F0*mf.x+mf.y;
+         ltcSpe*=Fr*(_LightObjects[i].MeshColor*_LightObjects[i].SpecularIntensity)*0.3183;//(1/3.1415926);
+
+        LtcCol+=saturate(ltcSpe+dif);
+       // LtcCol+=dif;
+     }
+    //这里我直接用了PBR间接光的F项带入metallic
+
+    
+     float3 ResultCol=(ForwardColor+LtcCol);
+     //ResultCol=ACESToneMapping(ResultCol,1.0f);
+     float3 outDebug=(mf.x*(0.1)+((1-0.1)*mf.y));
+
+    _Result[id.xy] = float4(ResultCol,1);
+}
