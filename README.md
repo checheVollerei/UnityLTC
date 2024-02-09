@@ -1,0 +1,2 @@
+# UnityLTC
+Unity内置管线下的LTC光照，重写了相机MRT，并在ComputeShader以后处理的方式进行光照计算,支持PBR材质的混合
